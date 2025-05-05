@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import logging
+import os
+import subprocess
+import sys
+import time
+
+PROG_NAME = os.path.basename(__file__)
+
+def env_with_cloud_api_token(token, secret):
+    env = os.environ.copy()
+    env['SAKURACLOUD_ACCESS_TOKEN'] = token
+    env['SAKURACLOUD_ACCESS_TOKEN_SECRET'] = secret
+    return env
+
+
+parser = argparse.ArgumentParser(
+    prog=PROG_NAME,
+    description="Fake renew certificate and update certificate on the target server",
+)
+parser.add_argument(
+    "--host",
+    default="my-ghes.example.com",
+    help="host FQDN of the target site",
+)
+parser.add_argument(
+    "--token",
+    default=os.environ.get("ACCESS_TOKEN"),
+    help="Access token for SAKURA Cloud DNS",
+)
+parser.add_argument(
+    "--secret",
+    default=os.environ.get("ACCESS_TOKEN_SECRET"),
+    help="Access token secret for SAKURA Cloud DNS",
+)
+parser.add_argument(
+    "--endpoint",
+    default="https://my-ghes.example.com:8443/manage",
+    help="endpoint URL for GitHub Management API (ex: https://example.com:8443/manage)",
+)
+parser.add_argument(
+    "--user",
+    default=os.environ.get("API_USER"),
+    help="user name for GitHub Management API",
+)
+parser.add_argument(
+    "--password",
+    default=os.environ.get("API_PASSORD"),
+    help="password for GitHub Management API",
+)
+args = parser.parse_args()
+
+logging.basicConfig(
+    level=logging.INFO,
+)
+
+for i, arg in enumerate(sys.argv):
+    logging.info(f"{i}: {arg}")
+logging.info(f"args={args}")
+
+isatty = sys.stdin.isatty()
+logging.info(f"isatty={isatty}")
+
+token = args.token
+if token is None:
+    if isatty:
+        token = input("Access Token: ")
+        logging.info(f"using token={token} read from prompt")
+    else:
+        token = sys.stdin.readline().strip()
+        logging.info(f"using token={token} read from stdin")
+else:
+    logging.info(f"using token={token} specified with option")
+
+secret = args.secret
+if secret is None:
+    if isatty:
+        secret = getpass.getpass("Access Token Secret: ")
+    else:
+        secret = sys.stdin.readline().strip()
+
+api_user = args.user
+if api_user is None:
+    if isatty:
+        api_user = input("User name for Management API: ")
+        logging.info(f"using api_user={api_user} read from prompt")
+    else:
+        api_user = sys.stdin.readline().strip()
+        logging.info(f"using api_user={api_user} read from stdin")
+else:
+    logging.info(f"using api_user={api_user} specified with option")
+
+api_password = args.password
+if api_password is None:
+    if isatty:
+        api_password = getpass.getpass("Password for Management API: ")
+    else:
+        api_password = sys.stdin.readline().strip()
+
+data_dir = "/etc/letsencrypt"
+lego_cmdline = "./fake-lego"
+lego_env = env_with_cloud_api_token(token, secret)
+lego_proc = subprocess.run(lego_cmdline, shell=True, env=lego_env, capture_output=True)
+returncode = lego_proc.returncode
+if returncode != 0:
+    errmsg = lego_proc.stderr.strip()
+    logging.error(f"exiting since lego failed with returncode={returncode}, err={errmsg}")
+
+host = args.host
+endpoint = args.endpoint
+cert_path = f"{data_dir}/certificates/_.{host}.crt"
+key_path = f"{data_dir}/certificates/_.{host}.key"
+set_cert_cmdline = f"./fake-set-cert --endpoint {endpoint} --cert {cert_path} --key {key_path}"
+with subprocess.Popen(set_cert_cmdline, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True) as proc:
+    proc.stdin.write(f"{api_user}\n{api_password}\n")
+    # proc.stdin.close()
+    stdout, stderr = proc.communicate()
+    logging.info(f"set-cert returncode={proc.returncode}, stdout={stdout.strip()}, stderr={stderr.strip()}")
