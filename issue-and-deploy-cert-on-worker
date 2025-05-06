@@ -276,7 +276,7 @@ def add_common_arguments(parser):
     )
     parser.add_argument(
         "--log-dir",
-        default=".",
+        default="/var/log/ghes-cert-update",
         help="path to log output directory",
     )
 
