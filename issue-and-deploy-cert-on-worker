@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+from datetime import datetime
+import getpass
+import io
+import logging
+import os
+import shlex
+import sys
+import tempfile
+import time
+from typing import Optional, TypedDict
+
+PROG_NAME = os.path.basename(__file__)
+
+
+async def read_and_log_command_output_or_err_stream(
+    stream: Optional[asyncio.StreamReader], label: str
+) -> Optional[str]:
+    if stream is None:
+        return None
+    buffer = io.StringIO()
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        buffer.write(line.decode())
+        logging.info(f"{label}: {line.decode().strip()}")
+    output = buffer.getvalue()
+    buffer.close()
+    return output
+
+
+def format_duration(
+    duration_in_seconds: float, seconds_ndigits: Optional[int] = None
+) -> str:
+    hours = int(duration_in_seconds // 3600)
+    minutes = int((duration_in_seconds % 3600) // 60)
+    seconds = round(duration_in_seconds % 60, seconds_ndigits)
+    if hours > 0:
+        return f"{hours}h{minutes}m{seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m{seconds}s"
+    else:
+        return f"{seconds}s"
+
+
+async def run_command(
+    cmd: str, cmd_for_log: Optional[str] = None, dry_run: bool = False
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    if cmd_for_log is None:
+        cmd_for_log = cmd
+    if dry_run:
+        logging.info(f"Dry run command: {cmd_for_log}")
+        return 0, "", ""
+
+    logging.info(f"Running command: {cmd_for_log}")
+    start_time = time.time()
+
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await asyncio.gather(
+        read_and_log_command_output_or_err_stream(proc.stdout, "STDOUT"),
+        read_and_log_command_output_or_err_stream(proc.stderr, "STDERR"),
+    )
+    await proc.wait()
+
+    elapsed = time.time() - start_time
+    returncode = proc.returncode
+    logging.info(f"Returncode: {returncode}, elapsed: {format_duration(elapsed, 2)}")
+    return returncode, stdout, stderr
+
+
+class LegoConfig(TypedDict):
+    lego_path: str
+    data_dir: str
+    email: str
+    domain: str
+
+
+async def run_lego_for_sakuracloud(cfg: LegoConfig, token: str, secret: str) -> int:
+    token_filename_prefix = f"{PROG_NAME}-token."
+    secret_filename_prefix = f"{PROG_NAME}-secret."
+    with tempfile.NamedTemporaryFile(
+        prefix=token_filename_prefix,
+    ) as token_file:
+        token_file.write(token.encode())
+        # We must flush token_file here since we cannot close token_file now.
+        # If we close it, it will be deleted because delete=True.
+        # We don't want to use delete=False as we would like it will be deleted on exit.
+        #
+        # https://docs.python.org/3.10/library/tempfile.html#tempfile.NamedTemporaryFile
+        #
+        # We can use delete=True and delete_on_close=False on Python 3.12+.
+        # https://docs.python.org/3.12/library/tempfile.html#tempfile.NamedTemporaryFile
+        token_file.flush()
+        with tempfile.NamedTemporaryFile(
+            prefix=secret_filename_prefix,
+        ) as secret_file:
+            secret_file.write(secret.encode())
+            secret_file.flush()
+            wildcard_domain = f"*.{cfg['domain']}"
+            cmdline = (
+                f"sudo env "
+                f"SAKURACLOUD_ACCESS_TOKEN_FILE={shlex.quote(token_file.name)} "
+                f"SAKURACLOUD_ACCESS_TOKEN_SECRET_FILE={shlex.quote(secret_file.name)} "
+                f"{cfg['lego_path']} --path {shlex.quote(cfg['data_dir'])} --dns sakuracloud "
+                f"--domains '{wildcard_domain}' --domain {cfg['domain']} --accept-tos "
+                f"--cert.timeout 60 --key-type rsa2048 renew --preferred-chain 'ISRG Root X1'"
+            )
+            [returncode, _, stderr] = await run_command(cmdline)
+            if returncode != 0:
+                errmsg = None if stderr is None else stderr.removesuffix("\n")
+                logging.error(f"lego failed with returncode={returncode}, err={errmsg}")
+            return 0 if returncode is None else returncode
+
+
+class DeployConfig(TypedDict):
+    endpoint: str
+    api_user: str
+    api_password: str
+    github_es_mgmt_path: str
+    lego_data_dir: str
+    domain: str
+
+
+async def deploy_cert_to_ghes(cfg: DeployConfig) -> int:
+    endpoint = cfg["endpoint"]
+    github_es_mgmt_path = cfg["github_es_mgmt_path"]
+    data_dir = cfg["lego_data_dir"]
+    domain = cfg["domain"]
+    cert_path = f"{data_dir}/certificates/_.{domain}.crt"
+    key_path = f"{data_dir}/certificates/_.{domain}.key"
+    cmdline = f"sudo {github_es_mgmt_path} certificate set --endpoint {endpoint} --cert {cert_path} --key {key_path}"
+
+    logging.info(f"Running command: {cmdline}")
+    start_time = time.time()
+
+    proc = await asyncio.create_subprocess_shell(
+        cmdline,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    api_user = cfg["api_user"]
+    api_password = cfg["api_password"]
+    if proc.stdin is not None:
+        proc.stdin.write(f"{api_user}\n{api_password}\n".encode())
+        proc.stdin.close()
+
+    stdout, stderr = await asyncio.gather(
+        read_and_log_command_output_or_err_stream(proc.stdout, "STDOUT"),
+        read_and_log_command_output_or_err_stream(proc.stderr, "STDERR"),
+    )
+    await proc.wait()
+
+    elapsed = time.time() - start_time
+    returncode = proc.returncode
+    logging.info(f"Returncode: {returncode}, elapsed: {format_duration(elapsed, 2)}")
+
+    if returncode != 0:
+        errmsg = None if stderr is None else stderr.removesuffix("\n")
+        logging.error(f"lego failed with returncode={returncode}, err={errmsg}")
+    return 0 if returncode is None else returncode
+
+
+async def issue(args):
+    lego_cfg = {
+        "lego_path": args.lego_path,
+        "data_dir": args.lego_data_dir,
+        "email": args.lego_email,
+        "domain": args.domain,
+    }
+    returncode = await run_lego_for_sakuracloud(lego_cfg, args.token, args.secret)
+    if returncode != 0:
+        raise "failed to issue certificate"
+
+
+async def deploy(args):
+    cfg = {
+        "endpoint": args.endpoint,
+        "api_user": args.api_user,
+        "api_password": args.api_password,
+        "domain": args.domain,
+        "github_es_mgmt_path": args.github_es_mgmt_path,
+        "lego_data_dir": args.lego_data_dir,
+    }
+    returncode = await deploy_cert_to_ghes(cfg)
+    if returncode != 0:
+        raise "failed to deploy certificate"
+
+
+def gather_secrets_for_issue(args):
+    isatty = sys.stdin.isatty()
+    logging.info(f"gather_secrets_for_issue, isatty={isatty}")
+
+    if args.token is None:
+        if isatty:
+            args.token = input("Access Token: ")
+            logging.info(f"using token={args.token} read from prompt")
+        else:
+            args.token = sys.stdin.readline().removesuffix("\n")
+            logging.info(f"using token={args.token} read from stdin")
+    else:
+        logging.info(f"using token={args.token} specified with option")
+
+    if args.secret is None:
+        if isatty:
+            args.secret = getpass.getpass("Access Token Secret: ")
+        else:
+            args.secret = sys.stdin.readline().removesuffix("\n")
+
+
+def gather_secrets_for_deploy(args):
+    isatty = sys.stdin.isatty()
+    logging.info(f"gather_secrets_for_deploy, isatty={isatty}")
+
+    if args.api_user is None:
+        if isatty:
+            args.api_user = input("User name for Management API: ")
+            logging.info(f"using api_user={args.api_user} read from prompt")
+        else:
+            args.api_user = sys.stdin.readline().removesuffix("\n")
+            logging.info(f"using api_user={args.api_user} read from stdin")
+    else:
+        logging.info(f"using api_user={args.api_user} specified with option")
+
+    if args.api_password is None:
+        if isatty:
+            args.api_password = getpass.getpass("Password for Management API: ")
+        else:
+            args.api_password = sys.stdin.readline().removesuffix("\n")
+
+
+async def subcommand_issue(args):
+    try:
+        gather_secrets_for_issue(args)
+        await issue(args)
+    except RuntimeError as e:
+        logging.error(f"{e}", file=sys.stderr)
+        sys.exit(1)
+
+
+async def subcommand_deploy(args):
+    try:
+        gather_secrets_for_deploy(args)
+        await deploy(args)
+    except RuntimeError as e:
+        logging.error(f"{e}", file=sys.stderr)
+        sys.exit(1)
+
+
+async def subcommand_issue_and_deploy(args):
+    try:
+        gather_secrets_for_issue(args)
+        gather_secrets_for_deploy(args)
+        await issue(args)
+        await deploy(args)
+    except RuntimeError as e:
+        logging.error(f"{e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def add_common_arguments(parser):
+    parser.add_argument(
+        "--domain",
+        help="domain FQDN of the target site",
+    )
+    parser.add_argument(
+        "--lego-data-dir",
+        default="/etc/letsencrypt",
+        help="path to lego data directory",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=".",
+        help="path to log output directory",
+    )
+
+
+def add_issue_arguments(parser):
+    parser.add_argument(
+        "--lego-path",
+        default="lego",
+        help="path to lego",
+    )
+    parser.add_argument(
+        "--lego-email",
+        help="email address to use with lego",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("ACCESS_TOKEN"),
+        help="Access token for SAKURA Cloud DNS",
+    )
+    parser.add_argument(
+        "--secret",
+        default=os.environ.get("ACCESS_TOKEN_SECRET"),
+        help="Access token secret for SAKURA Cloud DNS",
+    )
+
+
+def add_deploy_arguments(parser):
+    parser.add_argument(
+        "--github-es-mgmt-path",
+        default="github-es-mgmt",
+        help="path to github-es-mgmt CLI tool",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default="https://my-ghes.example.com:8443/manage",
+        help="endpoint URL for GitHub Management API (ex: https://example.com:8443/manage)",
+    )
+    parser.add_argument(
+        "--api-user",
+        default=os.environ.get("API_USER"),
+        help="user name for GitHub Management API",
+    )
+    parser.add_argument(
+        "--api-password",
+        default=os.environ.get("API_PASSORD"),
+        help="password for GitHub Management API",
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description="Fake run lego",
+    )
+
+    subparsers = parser.add_subparsers(title="subcommands")
+
+    parser_issue = subparsers.add_parser(
+        "issue", help="issue certificate using lego with SAKURA Cloud DNS provider"
+    )
+    parser_issue_and_deploy = subparsers.add_parser(
+        "issue-and-deploy", help="issue and deploy certificate to GHES"
+    )
+    parser_deploy = subparsers.add_parser("deploy", help="deploy certificate to GHES")
+
+    add_common_arguments(parser_issue)
+    add_issue_arguments(parser_issue)
+    parser_issue.set_defaults(func=subcommand_issue)
+
+    add_common_arguments(parser_issue_and_deploy)
+    add_issue_arguments(parser_issue_and_deploy)
+    add_deploy_arguments(parser_issue_and_deploy)
+    parser_issue_and_deploy.set_defaults(func=subcommand_issue_and_deploy)
+
+    add_common_arguments(parser_deploy)
+    add_deploy_arguments(parser_deploy)
+    parser_deploy.set_defaults(func=subcommand_deploy)
+
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(2)
+
+    return args
+
+def create_log_filename(log_dir: str) -> str:
+    now = datetime.now()
+    datetime_str = now.strftime("%Y%m%dT%H%M%S")
+    filename = f"issue-and-deploy-cert-{datetime_str}.log"
+    return os.path.join(log_dir, filename)
+
+async def main():
+    args = parse_args()
+
+    log_filename = create_log_filename(args.log_dir)
+    logging.basicConfig(
+        filename=log_filename,
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    for i, arg in enumerate(sys.argv):
+        logging.info(f"{i}: {arg}")
+    logging.info(f"args={args}")
+
+    await args.func(args)
+
+
+asyncio.run(main())
