@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import logging
 import shutil
 import sys
-from typing import TypedDict
+from typing import Optional, TypedDict
+from zoneinfo import ZoneInfo
 
 
 class SubjectAlternativeName(TypedDict):
@@ -15,13 +17,13 @@ class SubjectAlternativeName(TypedDict):
 
 
 class CertInfo(TypedDict):
-    notBefore: str
-    notAfter: str
-    subject: str
-    subjectHash: str
-    san: list[SubjectAlternativeName]
-    issuer: str
-    issuerHash: str
+    notBefore: Optional[str]
+    notAfter: Optional[str]
+    subject: Optional[str]
+    subjectHash: Optional[str]
+    san: Optional[list[SubjectAlternativeName]]
+    issuer: Optional[str]
+    issuerHash: Optional[str]
 
 
 def parse_san_term(term: str) -> SubjectAlternativeName:
@@ -34,39 +36,55 @@ def parse_san(san: str) -> list[SubjectAlternativeName]:
 
 
 async def extract_info_from_openssl_x509_output_stream(
-    stream: asyncio.StreamReader,
-) -> CertInfo:
-    info = {}
+    stream: Optional[asyncio.StreamReader],
+) -> Optional[CertInfo]:
+    if stream is None:
+        return None
     seenSubject = False
     seenSanTitle = False
     seenIssuer = False
+    notBefore = None
+    notAfter = None
+    subject = None
+    subjectHash = None
+    san = None
+    issuer = None
+    issuerHash = None
     while True:
-        line = await stream.readline()
-        if not line:
+        line_bytes = await stream.readline()
+        if not line_bytes:
             break
-        line = line.decode().strip()
+        line = line_bytes.decode().strip()
         if line.startswith("notBefore="):
-            info["notBefore"] = line.partition("=")[2]
+            notBefore = line.partition("=")[2]
         elif line.startswith("notAfter="):
-            info["notAfter"] = line.partition("=")[2]
+            notAfter = line.partition("=")[2]
         elif line.startswith("subject="):
-            info["subject"] = line.partition("=")[2]
+            subject = line.partition("=")[2]
             seenSubject = True
         elif seenSubject:
             seenSubject = False
-            info["subjectHash"] = line
+            subjectHash = line
         elif line == "X509v3 Subject Alternative Name:":
             seenSanTitle = True
         elif seenSanTitle:
             seenSanTitle = False
-            info["san"] = parse_san(line.strip())
+            san = parse_san(line.strip())
         elif line.startswith("issuer="):
-            info["issuer"] = line.partition("=")[2]
+            issuer = line.partition("=")[2]
             seenIssuer = True
         elif seenIssuer:
             seenIssuer = False
-            info["issuerHash"] = line
-    return info
+            issuerHash = line
+    return {
+        "notBefore": notBefore,
+        "notAfter": notAfter,
+        "subject": subject,
+        "subjectHash": subjectHash,
+        "san": san,
+        "issuer": issuer,
+        "issuerHash": issuerHash,
+    }
 
 
 def check_command_exists(cmd: str):
@@ -75,15 +93,20 @@ def check_command_exists(cmd: str):
         sys.exit(1)
 
 
-async def read_multi_certs_in_stream(stream: asyncio.StreamReader) -> list[str]:
+async def read_multi_certs_in_stream(
+    stream: Optional[asyncio.StreamReader],
+) -> list[str]:
+    if stream is None:
+        return []
+
     certs = []
     buffer = io.StringIO()
     inCert = False
     while True:
-        line = await stream.readline()
-        if not line:
+        line_bytes = await stream.readline()
+        if not line_bytes:
             break
-        line = line.decode()
+        line = line_bytes.decode()
         if inCert:
             buffer.write(line)
             if line.strip() == "-----END CERTIFICATE-----":
@@ -125,7 +148,11 @@ def sync_read_multi_certs_in_file(path: str) -> list[str]:
         return sync_read_multi_certs_in_stream(f)
 
 
-async def read_command_output_or_err_stream(stream: asyncio.StreamReader) -> str:
+async def read_command_output_or_err_stream(
+    stream: Optional[asyncio.StreamReader],
+) -> str:
+    if stream is None:
+        return ""
     buffer = io.StringIO()
     while True:
         line = await stream.readline()
@@ -148,8 +175,9 @@ async def get_certs_from_remote_server(addr: str) -> list[str]:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    proc.stdin.write("Q\n".encode())
-    proc.stdin.close()
+    if proc.stdin is not None:
+        proc.stdin.write("Q\n".encode())
+        proc.stdin.close()
 
     certs, stderr = await asyncio.gather(
         read_multi_certs_in_stream(proc.stdout),
@@ -173,8 +201,9 @@ async def extract_info_from_cert(cert: str) -> CertInfo:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    proc.stdin.write(cert.encode())
-    proc.stdin.close()
+    if proc.stdin is not None:
+        proc.stdin.write(cert.encode())
+        proc.stdin.close()
 
     info, stderr = await asyncio.gather(
         extract_info_from_openssl_x509_output_stream(proc.stdout),
@@ -182,7 +211,7 @@ async def extract_info_from_cert(cert: str) -> CertInfo:
     )
     await proc.wait()
 
-    if proc.returncode != 0:
+    if proc.returncode != 0 or info is None:
         raise RuntimeError(
             f"openssl x509 failed with returncode={proc.returncode}, stderr={stderr.strip()}"
         )
@@ -191,6 +220,32 @@ async def extract_info_from_cert(cert: str) -> CertInfo:
 
 async def extract_info_from_certs(certs: list[str]) -> list[CertInfo]:
     return [await extract_info_from_cert(cert) for cert in certs]
+
+
+def parse_cert_datetime(dt: str) -> datetime:
+    """parse certificate datetime like "Mar 18 05:36:21 2025 GMT" """
+    if not dt.endswith(" GMT"):
+        raise ValueError(f"time data '{dt}' not end with ' GMT'")
+    return datetime.strptime(dt.removesuffix(" GMT"), "%b %d %H:%M:%S %Y").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def show_next_renewal_date(info: CertInfo, days: int):
+    if info["notBefore"] is None or info["notAfter"] is None:
+        print("failed to extract notBefore or notAfter.", file=sys.stderr)
+        return
+
+    not_before = parse_cert_datetime(info["notBefore"])
+    not_after = parse_cert_datetime(info["notAfter"])
+
+    tokyo_tz = ZoneInfo("Asia/Tokyo")
+    next_renewal = (not_after - timedelta(days=days)).astimezone(tokyo_tz)
+
+    print(
+        f"notBefore:\t{not_before}\nnotAfter:\t{not_after}\nnextRenewal:\t{next_renewal}",
+        file=sys.stderr,
+    )
 
 
 async def main():
@@ -210,6 +265,27 @@ async def main():
 
     parser.add_argument("--file", help="path to local certificate file")
     parser.add_argument("--server", help="remote server hostname or hostname:port")
+    parser.add_argument(
+        "--indent",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="enable indent of output json",
+    )
+    parser.add_argument(
+        "--indent-width", type=int, default=2, help="indent width of output json"
+    )
+    parser.add_argument(
+        "--next",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Print next renewal date to stderr",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="The number of days left on a certificate to renew it. (default: 30)",
+    )
 
     args = parser.parse_args()
     if (args.file is not None and args.server is not None) or (
@@ -224,7 +300,12 @@ async def main():
     elif args.server is not None:
         certs = await get_certs_from_remote_server(args.server)
     cert_info_list = await extract_info_from_certs(certs)
-    print(json.dumps(cert_info_list, indent=2))
+
+    indent = args.indent_width if args.indent else None
+    print(json.dumps(cert_info_list, indent=indent))
+
+    if args.next:
+        show_next_renewal_date(cert_info_list[0], args.days)
 
 
 asyncio.run(main())
