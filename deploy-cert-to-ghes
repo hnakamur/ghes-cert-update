@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import getpass
+import io
+import logging
+import os
+import sys
+import time
+from typing import Optional, TypedDict
+
+PROG_NAME = os.path.basename(__file__)
+
+
+async def read_and_log_command_output_or_err_stream(
+    stream: Optional[asyncio.StreamReader], label: str
+) -> Optional[str]:
+    if stream is None:
+        return None
+    buffer = io.StringIO()
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        buffer.write(line.decode())
+        logging.info(f"{label}: {line.decode().strip()}")
+    output = buffer.getvalue()
+    buffer.close()
+    return output
+
+
+def format_duration(
+    duration_in_seconds: float, seconds_ndigits: Optional[int] = None
+) -> str:
+    hours = int(duration_in_seconds // 3600)
+    minutes = int((duration_in_seconds % 3600) // 60)
+    seconds = round(duration_in_seconds % 60, seconds_ndigits)
+    if hours > 0:
+        return f"{hours}h{minutes}m{seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m{seconds}s"
+    else:
+        return f"{seconds}s"
+
+
+
+class DeployConfig(TypedDict):
+    endpoint: str
+    api_user: str
+    api_password: str
+    github_es_mgmt_path: str
+    lego_data_dir: str
+    domain: str
+
+
+async def deploy_cert_to_ghes(cfg: DeployConfig) -> int:
+    endpoint = cfg["endpoint"]
+    github_es_mgmt_path = cfg["github_es_mgmt_path"]
+    data_dir = cfg["lego_data_dir"]
+    domain = cfg["domain"]
+    cert_path = f"{data_dir}/certificates/_.{domain}.crt"
+    key_path = f"{data_dir}/certificates/_.{domain}.key"
+    cmdline = f"sudo {github_es_mgmt_path} certificate set --endpoint {endpoint} --cert {cert_path} --key {key_path}"
+
+    logging.info(f"Running command: {cmdline}")
+    start_time = time.time()
+
+    proc = await asyncio.create_subprocess_shell(
+        cmdline, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+
+    api_user = cfg["api_user"]
+    api_password = cfg["api_password"]
+    proc.stdin.write(f"{api_user}\n{api_password}\n".encode())
+    proc.stdin.close()
+
+    stdout, stderr = await asyncio.gather(
+        read_and_log_command_output_or_err_stream(proc.stdout, "STDOUT"),
+        read_and_log_command_output_or_err_stream(proc.stderr, "STDERR"),
+    )
+    await proc.wait()
+
+    elapsed = time.time() - start_time
+    returncode = proc.returncode
+    logging.info(f"Returncode: {returncode}, elapsed: {format_duration(elapsed, 2)}")
+
+    if returncode != 0:
+        errmsg = None if stderr is None else stderr.removesuffix("\n")
+        logging.error(f"lego failed with returncode={returncode}, err={errmsg}")
+    return 0 if returncode is None else returncode
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description="Fake renew certificate and update certificate on the target server",
+    )
+
+    parser.add_argument(
+        "--github-es-mgmt-path",
+        default="github-es-mgmt",
+        help="path to github-es-mgmt CLI tool",
+    )
+    parser.add_argument(
+        "--lego-data-dir",
+        default="/etc/letsencrypt",
+        help="path to lego data directory",
+    )
+    parser.add_argument(
+        "--domain",
+        default="my-ghes.example.com",
+        help="FQDN of the target GHES site",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("ACCESS_TOKEN"),
+        help="Access token for SAKURA Cloud DNS",
+    )
+    parser.add_argument(
+        "--secret",
+        default=os.environ.get("ACCESS_TOKEN_SECRET"),
+        help="Access token secret for SAKURA Cloud DNS",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default="https://my-ghes.example.com:8443/manage",
+        help="endpoint URL for GitHub Management API (ex: https://example.com:8443/manage)",
+    )
+    parser.add_argument(
+        "--user",
+        default=os.environ.get("API_USER"),
+        help="user name for GitHub Management API",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("API_PASSORD"),
+        help="password for GitHub Management API",
+    )
+
+    return parser.parse_args()
+
+
+async def main():
+    args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+    )
+
+    for i, arg in enumerate(sys.argv):
+        logging.info(f"{i}: {arg}")
+    logging.info(f"args={args}")
+
+    isatty = sys.stdin.isatty()
+    logging.info(f"isatty={isatty}")
+
+    api_user = args.user
+    if api_user is None:
+        if isatty:
+            api_user = input("User name for Management API: ")
+            logging.info(f"using api_user={api_user} read from prompt")
+        else:
+            api_user = sys.stdin.readline().strip()
+            logging.info(f"using api_user={api_user} read from stdin")
+    else:
+        logging.info(f"using api_user={api_user} specified with option")
+
+    api_password = args.password
+    if api_password is None:
+        if isatty:
+            api_password = getpass.getpass("Password for Management API: ")
+        else:
+            api_password = sys.stdin.readline().strip()
+
+    cfg = {
+        "endpoint": args.endpoint,
+        "api_user": api_user,
+        "api_password": api_password,
+        "domain": args.domain,
+        "github_es_mgmt_path": args.github_es_mgmt_path,
+        "lego_data_dir": args.lego_data_dir,
+    }
+    returncode = await deploy_cert_to_ghes(cfg)
+    sys.exit(returncode)
+
+
+asyncio.run(main())

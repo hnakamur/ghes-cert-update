@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import logging
+import os
+import sys
+import time
+
+PROG_NAME = os.path.basename(__file__)
+
+MASKED_MARK = "[MASKED]"
+
+
+def mask_secret(secret: str) -> str:
+    if len(secret) > 4:
+        return f"{secret[:2]}{MASKED_MARK}{secret[-2:]}"
+    return MASKED_MARK
+
+def subcommand_sertificate_set(args):
+    for i, arg in enumerate(sys.argv):
+        logging.info(f"{i}: {arg}")
+    logging.info(f"args={args}")
+
+    isatty = sys.stdin.isatty()
+    logging.info(f"isatty={isatty}")
+
+    api_user = args.user
+    if api_user is None:
+        api_user = sys.stdin.readline().removesuffix("\n")
+        logging.info(f"using api_user={api_user} read from stdin")
+    else:
+        logging.info(f"using api_user={api_user} specified with option")
+
+    api_password = args.password
+    if api_password is None:
+        api_password = sys.stdin.readline().removesuffix("\n")
+
+    logging.info(f"{PROG_NAME} using api_user={api_user}, api_password={mask_secret(api_password)}")
+
+    for i in range(5):
+        logging.info(f"fake setting certificate")
+        time.sleep(1)
+
+    logging.info(f"fake finshed setting certificate")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description="mock of github-es-mgmt CLI",
+    )
+
+    subparsers = parser.add_subparsers(title="subcommands")
+
+    parser_certificate = subparsers.add_parser(
+        "certificate", help="subcommand for certificate"
+    )
+
+    certificate_subparsers = parser_certificate.add_subparsers(title="subcommands")
+    parser_certificate_set = certificate_subparsers.add_parser(
+        "set", help="subcommand for setting certificate"
+    )
+    parser_certificate_set.set_defaults(func=subcommand_sertificate_set)
+
+    parser_certificate_set.add_argument(
+        "--host",
+        help="host FQDN of the target site",
+    )
+    parser_certificate_set.add_argument(
+        "--endpoint",
+        help="endpoint URL for GitHub Management API (ex: https://example.com:8443/manage)",
+    )
+    parser_certificate_set.add_argument(
+        "--user",
+        default=os.environ.get("API_USER"),
+        help="user name for GitHub Management API",
+    )
+    parser_certificate_set.add_argument(
+        "--password",
+        default=os.environ.get("API_PASSORD"),
+        help="password for GitHub Management API",
+    )
+    parser_certificate_set.add_argument(
+        "--cert",
+        help="path to the certificate file",
+    )
+    parser_certificate_set.add_argument(
+        "--key",
+        help="path to the key file",
+    )
+
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(2)
+    return args
+
+
+def main():
+    args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+    )
+
+    args.func(args)
+
+
+main()

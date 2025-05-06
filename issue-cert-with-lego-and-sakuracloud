@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import getpass
+import io
+import logging
+import os
+import shlex
+import sys
+import tempfile
+import time
+from typing import Optional, TypedDict
+
+PROG_NAME = os.path.basename(__file__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description="Fake run lego",
+    )
+    parser.add_argument(
+        "--lego-path",
+        default="lego",
+        help="path to lego",
+    )
+    parser.add_argument(
+        "--lego-data-dir",
+        default="/etc/letsencrypt",
+        help="path to lego data directory",
+    )
+    parser.add_argument(
+        "--lego-email",
+        help="email address to use with lego",
+    )
+    parser.add_argument(
+        "--domain",
+        help="domain FQDN of the target site",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("ACCESS_TOKEN"),
+        help="Access token for SAKURA Cloud DNS",
+    )
+    parser.add_argument(
+        "--secret",
+        default=os.environ.get("ACCESS_TOKEN_SECRET"),
+        help="Access token secret for SAKURA Cloud DNS",
+    )
+    return parser.parse_args()
+
+
+async def read_and_log_command_output_or_err_stream(
+    stream: Optional[asyncio.StreamReader], label: str
+) -> Optional[str]:
+    if stream is None:
+        return None
+    buffer = io.StringIO()
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        buffer.write(line.decode())
+        logging.info(f"{label}: {line.decode().strip()}")
+    output = buffer.getvalue()
+    buffer.close()
+    return output
+
+
+def format_duration(
+    duration_in_seconds: float, seconds_ndigits: Optional[int] = None
+) -> str:
+    hours = int(duration_in_seconds // 3600)
+    minutes = int((duration_in_seconds % 3600) // 60)
+    seconds = round(duration_in_seconds % 60, seconds_ndigits)
+    if hours > 0:
+        return f"{hours}h{minutes}m{seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m{seconds}s"
+    else:
+        return f"{seconds}s"
+
+
+async def run_command(
+    cmd: str, cmd_for_log: Optional[str] = None, dry_run: bool = False
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    if cmd_for_log is None:
+        cmd_for_log = cmd
+    if dry_run:
+        logging.info(f"Dry run command: {cmd_for_log}")
+        return 0, "", ""
+
+    logging.info(f"Running command: {cmd_for_log}")
+    start_time = time.time()
+
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await asyncio.gather(
+        read_and_log_command_output_or_err_stream(proc.stdout, "STDOUT"),
+        read_and_log_command_output_or_err_stream(proc.stderr, "STDERR"),
+    )
+    await proc.wait()
+
+    elapsed = time.time() - start_time
+    returncode = proc.returncode
+    logging.info(f"Returncode: {returncode}, elapsed: {format_duration(elapsed, 2)}")
+    return returncode, stdout, stderr
+
+
+class LegoConfig(TypedDict):
+    lego_path: str
+    data_dir: str
+    email: str
+    domain: str
+
+
+async def run_lego_for_sakuracloud(cfg: LegoConfig, token: str, secret: str) -> int:
+    token_filename_prefix = f"{PROG_NAME}-token."
+    secret_filename_prefix = f"{PROG_NAME}-secret."
+    with tempfile.NamedTemporaryFile(
+        prefix=token_filename_prefix,
+    ) as token_file:
+        token_file.write(token.encode())
+        # We must flush token_file here since we cannot close token_file now.
+        # If we close it, it will be deleted because delete=True.
+        # We don't want to use delete=False as we would like it will be deleted on exit.
+        #
+        # https://docs.python.org/3.10/library/tempfile.html#tempfile.NamedTemporaryFile
+        #
+        # We can use delete=True and delete_on_close=False on Python 3.12+.
+        # https://docs.python.org/3.12/library/tempfile.html#tempfile.NamedTemporaryFile
+        token_file.flush()
+        with tempfile.NamedTemporaryFile(
+            prefix=secret_filename_prefix,
+        ) as secret_file:
+            secret_file.write(secret.encode())
+            secret_file.flush()
+            wildcard_domain = f"*.{cfg['domain']}"
+            cmdline = (
+                f"sudo env "
+                f"SAKURACLOUD_ACCESS_TOKEN_FILE={shlex.quote(token_file.name)} "
+                f"SAKURACLOUD_ACCESS_TOKEN_SECRET_FILE={shlex.quote(secret_file.name)} "
+                f"{cfg['lego_path']} --path {shlex.quote(cfg['data_dir'])} --dns sakuracloud "
+                f"--domains '{wildcard_domain}' --domain {cfg['domain']} --accept-tos "
+                f"--cert.timeout 60 --key-type rsa2048 renew --preferred-chain 'ISRG Root X1'"
+            )
+            [returncode, _, stderr] = await run_command(cmdline)
+            if returncode != 0:
+                errmsg = None if stderr is None else stderr.removesuffix("\n")
+                logging.error(f"lego failed with returncode={returncode}, err={errmsg}")
+            return 0 if returncode is None else returncode
+
+
+async def main():
+    args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+    )
+
+    for i, arg in enumerate(sys.argv):
+        logging.info(f"{i}: {arg}")
+    logging.info(f"args={args}")
+
+    isatty = sys.stdin.isatty()
+    logging.info(f"isatty={isatty}")
+
+    token = args.token
+    if token is None:
+        if isatty:
+            token = input("Access Token: ")
+            logging.info(f"using token={token} read from prompt")
+        else:
+            token = sys.stdin.readline().removesuffix("\n")
+            logging.info(f"using token={token} read from stdin")
+    else:
+        logging.info(f"using token={token} specified with option")
+
+    secret = args.secret
+    if secret is None:
+        if isatty:
+            secret = getpass.getpass("Access Token Secret: ")
+        else:
+            secret = sys.stdin.readline().removesuffix("\n")
+
+    lego_cfg = {
+        "lego_path": args.lego_path,
+        "data_dir": args.lego_data_dir,
+        "email": args.lego_email,
+        "domain": args.domain,
+    }
+    returncode = await run_lego_for_sakuracloud(lego_cfg, token, secret)
+    sys.exit(returncode)
+
+
+asyncio.run(main())

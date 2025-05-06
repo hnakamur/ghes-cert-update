@@ -9,19 +9,27 @@ PROG_NAME = os.path.basename(__file__)
 
 MASKED_MARK = "[MASKED]"
 
+
 def mask_secret(secret: str) -> str:
     if len(secret) > 4:
         return f"{secret[:2]}{MASKED_MARK}{secret[-2:]}"
     return MASKED_MARK
 
+
 def get_value_from_env_or_file(env_name: str) -> Optional[str]:
     value = os.environ.get(env_name)
     if value is not None:
+        logging.debug(f"return value from env_name={env_name}, value={value}")
         return value
     filename = os.environ.get(f"{env_name}_FILE")
     if filename is not None:
+        logging.debug(f"reading filename={filename} for env_name={env_name}")
         with open(filename) as f:
-            return f.read().removesuffix("\n")
+            value = f.read().removesuffix("\n")
+            logging.debug(
+                f"read from file env_name={env_name}, fliename={filename}, value={value}"
+            )
+            return value
     return None
 
 
@@ -29,16 +37,18 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-token = get_value_from_env_or_file('SAKURACLOUD_ACCESS_TOKEN')
-secret = get_value_from_env_or_file('SAKURACLOUD_ACCESS_TOKEN_SECRET')
+token = get_value_from_env_or_file("SAKURACLOUD_ACCESS_TOKEN")
+secret = get_value_from_env_or_file("SAKURACLOUD_ACCESS_TOKEN_SECRET")
 if token is None or secret is None:
-    logging.error("Please set both of SAKURACLOUD_ACCESS_TOKEN and SAKURACLOUD_ACCESS_TOKEN_SECRET environment variables")
+    logging.error(
+        "Please set both of SAKURACLOUD_ACCESS_TOKEN and SAKURACLOUD_ACCESS_TOKEN_SECRET environment variables"
+    )
     sys.exit(2)
 
 logging.info(f"{PROG_NAME} using token={token}, secret={mask_secret(secret)}")
 
 for i in range(5):
-    logging.info(f"fake lego running")
+    logging.info("fake lego running")
     time.sleep(1)
 
-logging.info(f"fake lego finshed")
+logging.info("fake lego finshed")
