@@ -107,7 +107,8 @@ async def run_lego_for_sakuracloud(cfg: LegoConfig, token: str, secret: str) -> 
                 f"SAKURACLOUD_ACCESS_TOKEN_FILE={shlex.quote(token_file.name)} "
                 f"SAKURACLOUD_ACCESS_TOKEN_SECRET_FILE={shlex.quote(secret_file.name)} "
                 f"{cfg['lego_path']} --path {shlex.quote(cfg['data_dir'])} --dns sakuracloud "
-                f"--domains '{wildcard_domain}' --domain {cfg['domain']} --accept-tos "
+                f"--email {cfg['email']} "
+                f"--domains '{wildcard_domain}' --domains {cfg['domain']} --accept-tos "
                 f"--cert.timeout 60 --key-type rsa2048 renew --preferred-chain 'ISRG Root X1'"
             )
             [returncode, _, stderr] = await run_command(cmdline)
@@ -133,7 +134,7 @@ async def deploy_cert_to_ghes(cfg: DeployConfig) -> int:
     domain = cfg["domain"]
     cert_path = f"{data_dir}/certificates/_.{domain}.crt"
     key_path = f"{data_dir}/certificates/_.{domain}.key"
-    cmdline = f"sudo {github_es_mgmt_path} certificate set --endpoint {endpoint} --cert {cert_path} --key {key_path}"
+    cmdline = f"sudo {github_es_mgmt_path} certificate set --endpoint {endpoint} --cert {cert_path} --key {key_path} --apply"
 
     logging.info(f"Running command: {cmdline}")
     start_time = time.time()
